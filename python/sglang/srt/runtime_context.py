@@ -816,11 +816,6 @@ class RuntimeContext:
         object is the raw input; the resolution it carries is its declaration
         stash, which is what the bags are projected from.
         """
-        # Seed the capture tier for the new lifecycle (defaults for sentinel
-        # and mock publishes, which carry no config).
-        self.flags.capture.enable_torch_compile = getattr(
-            server_args, "enable_torch_compile", False
-        )
         self._server_args = server_args
         # The adaptive draft-token bound memoizes on the config *path*, so a new
         # publication that reuses the path must not inherit the bound computed
@@ -830,6 +825,19 @@ class RuntimeContext:
         # truth for config reads). Driven by NS(...) metadata; a mock/partial
         # config with no NS markers yields an empty tree (no bags projected).
         self._config_bags = _build_config_bags(server_args)
+        # Seed the capture tier for the new lifecycle, from the bag rather than
+        # the field: the field is raw input, and what the process runs under is
+        # the resolved value (which `override_server_args` supplies through a
+        # declaration, not a write). Falls back for sentinel and mock publishes,
+        # which carry no NS metadata and so project no bags.
+        bags = self._config_bags
+        exec_bag = bags.get("exec") if bags else None
+        graph = exec_bag._subs.get("graph") if exec_bag is not None else None
+        self.flags.capture.enable_torch_compile = (
+            graph.enable_torch_compile
+            if graph is not None and "enable_torch_compile" in graph._fields
+            else getattr(server_args, "enable_torch_compile", False)
+        )
         # Wire the published `parallel` bag onto the live wrapper: it is the slot
         # the `config` property reads, which is how config-only leaves like
         # pp_max_micro_batch_size are spelled.
@@ -1047,36 +1055,40 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
-        from sglang.srt.arg_groups.overrides import (
-            _apply_fields,
-            declare_late_resolution,
-        )
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
 
-        server_args = ServerArgs(model_path="dummy")
-        server_args.resolve_once()
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(
-            type(server_args).__dataclass_fields__
+            ServerArgs.__dataclass_fields__
         )
         if unknown:
             raise ValueError(
                 f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
             )
-        # Declared so the projection sees it; late, because the record is
-        # resolved already and not yet published.
-        # Underscore names are not fields at all (they seed private property
-        # caches), so they stay a direct write.
-        declared = {
-            name: value for name, value in self._fields.items() if name[0] != "_"
-        }
-        if declared:
-            declare_late_resolution(server_args, "override_server_args", **declared)
-        # This hook stands in for a launch: the caller's values are both what
-        # the operator passed and what resolution decided, so they go on the
-        # record as well as into the stash. Production late resolution declares
-        # only -- there the record stays the operator's input.
-        _apply_fields(server_args, self._fields)
+        # Behaviour-preserving: the caller's values reach readers the way they
+        # did before this series, only through the declaration channel instead
+        # of a field write. Resolution still runs at the dummy boundary over
+        # defaults, so it neither validates the caller's values nor derives
+        # anything from them -- and, just as importantly, no handler sees them,
+        # so none of their process-wide side effects fire.
+        #
+        # Split by field-ness, not by spelling: a leading underscore usually
+        # means a private cache slot, but some real fields are spelled that way
+        # (`_speculative_draft_quantization_explicitly_set`), and routing one of
+        # those around the declaration leaves the record and the bags
+        # disagreeing about it.
+        fields = set(ServerArgs.__dataclass_fields__)
+        asked = {n: v for n, v in self._fields.items() if n in fields}
+        seeded = {n: v for n, v in self._fields.items() if n not in fields}
+        server_args = ServerArgs(model_path="dummy")
+        server_args.resolve_once()
+        if asked:
+            declare_late_resolution(server_args, "override_server_args", **asked)
+        # Private non-field slots seed property caches; the strict guard exempts
+        # them and they are not part of the record's raw input.
+        for name, value in seeded.items():
+            object.__setattr__(server_args, name, value)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
